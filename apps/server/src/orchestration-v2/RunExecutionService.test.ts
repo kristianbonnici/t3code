@@ -3844,21 +3844,28 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
   }),
 );
 
-it.effect("interrupts open tool calls when the stream ends without a root terminal", () =>
+it.effect("interrupts open tool calls when the session ends the stream without a terminal", () =>
   Effect.gen(function* () {
-    const { written } = yield* captureRootRunTermination({
-      key: "stream-end-open-tool",
-      shouldFinalizeRun: () => Effect.succeed(true),
-      events: (ids) =>
-        Stream.fromIterable([backgroundTurnItemEvent(ids, "command_execution", "running", 1)]),
-    });
-    assert.deepEqual(
-      written.map((item) => [item.type, item.status]),
-      [
-        ["command_execution", "interrupted"],
-        ["error", "failed"],
-      ],
-    );
+    // A session that stops on its own ends the stream; a crashed one fails it
+    // with whatever cause it had.
+    for (const ending of ["end", "defect"] as const) {
+      const { written } = yield* captureRootRunTermination({
+        key: `stream-${ending}-open-tool`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.concat(
+            Stream.fromIterable([backgroundTurnItemEvent(ids, "command_execution", "running", 1)]),
+            ending === "end" ? Stream.empty : Stream.die("provider adapter crashed"),
+          ),
+      });
+      assert.deepEqual(
+        written.map((item) => [item.type, item.status]),
+        [
+          ["command_execution", "interrupted"],
+          ["error", "failed"],
+        ],
+      );
+    }
   }),
 );
 
@@ -3929,40 +3936,44 @@ it.effect("refreshes pull requests only once when startup failure closes its eve
   }),
 );
 
-it.effect("interrupts a tool call reported before the turn fails to start", () =>
+it.effect("leaves open tool calls running when T3 fails to store a provider event", () =>
   Effect.gen(function* () {
-    const key = "start-failure-open-tool";
-    const toolReported = yield* Deferred.make<void>();
-    const { written } = yield* captureRootRunTermination({
-      key,
-      shouldFinalizeRun: () => Effect.succeed(true),
-      events: (ids) =>
-        Stream.concat(
-          Stream.fromIterable([backgroundTurnItemEvent(ids, "dynamic_tool", "running", 1)]),
-          Stream.unwrap(Deferred.succeed(toolReported, undefined).pipe(Effect.as(Stream.never))),
-        ),
-      startTurn: (input) =>
-        Deferred.await(toolReported).pipe(
-          Effect.andThen(
-            Effect.fail(
-              new ProviderAdapter.ProviderAdapterTurnStartError({
-                driver,
-                threadId: input.threadId,
-                providerThreadId: input.providerThread.id,
-                runId: input.runId,
-                cause: "provider failed after reporting a tool call",
-              }),
-            ),
-          ),
-        ),
-    });
-    assert.deepEqual(
-      written.map((item) => [item.type, item.status]),
-      [
-        ["dynamic_tool", "interrupted"],
-        ["error", "failed"],
-      ],
-    );
+    for (const failure of ["normalize", "publish"] as const) {
+      const key = `ingest-failure-open-tool:${failure}`;
+      const commandItemId = TurnItemId.make(`turn-item:${key}:command`);
+      const { written, observed } = yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.fromIterable([
+            backgroundTurnItemEvent(ids, "dynamic_tool", "running", 1),
+            backgroundTurnItemEvent(ids, "command_execution", "running", 2, commandItemId),
+          ]),
+        // The provider is still running; only T3's own handling of an event fails.
+        ingestNormalized: (ingest) =>
+          ingest.event.type === "turn_item.updated" && ingest.event.turnItem.id === commandItemId
+            ? Effect.fail(
+                failure === "normalize"
+                  ? new ProviderEventIngestor.ProviderEventNormalizeError({
+                      providerSessionId: ingest.providerSessionId,
+                      threadId: ingest.threadId,
+                      providerEvent: ingest.event,
+                      cause: "unexpected item shape",
+                    })
+                  : new ProviderEventIngestor.ProviderEventPublishError({
+                      providerSessionId: ingest.providerSessionId,
+                      eventCount: 1,
+                      cause: "database unavailable",
+                    }),
+              )
+            : Effect.succeed([]),
+      });
+      assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
+      assert.deepEqual(
+        written.map((item) => [item.type, item.status]),
+        [["error", "failed"]],
+      );
+    }
   }),
 );
 
@@ -3991,6 +4002,7 @@ function captureRootRunTermination(input: {
     ProviderAdapter.ProviderAdapterV2Error
   >;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
+  readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
@@ -4069,7 +4081,7 @@ function captureRootRunTermination(input: {
           }),
           IdAllocator.layer,
           Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
-            ingestNormalized: () => Effect.succeed([]),
+            ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
           }),
           ServerSettings.layerTest(),
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {

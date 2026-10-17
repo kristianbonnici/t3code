@@ -121,7 +121,11 @@ function makeTestAdapter(input: {
   readonly holdFirstTurn?: Deferred.Deferred<void>;
   readonly releaseFirstTurn?: Deferred.Deferred<void>;
   /** A tool call the held turn reports running before it holds. */
-  readonly heldRunningToolCall?: TurnItemId;
+  readonly heldRunningToolCall?: {
+    readonly id: TurnItemId;
+    readonly title: string;
+    readonly toolName: string;
+  };
 }): ProviderAdapter.ProviderAdapterV2["Service"] {
   return {
     instanceId: input.instanceId,
@@ -284,7 +288,7 @@ function makeTestAdapter(input: {
                     type: "turn_item.updated",
                     driver: input.driver,
                     turnItem: {
-                      id: input.heldRunningToolCall,
+                      id: input.heldRunningToolCall.id,
                       threadId: turnInput.threadId,
                       runId: turnInput.runId,
                       nodeId: turnInput.rootNodeId,
@@ -294,12 +298,12 @@ function makeTestAdapter(input: {
                       parentItemId: null,
                       ordinal: turnInput.runOrdinal * 100 + 1,
                       status: "running",
-                      title: "T3 Thread Configure",
+                      title: input.heldRunningToolCall.title,
                       startedAt,
                       completedAt: null,
                       updatedAt: startedAt,
                       type: "dynamic_tool",
-                      toolName: "t3_thread_configure",
+                      toolName: input.heldRunningToolCall.toolName,
                       input: {},
                     },
                   });
@@ -1525,119 +1529,140 @@ describe("orchestration v2 provider switching", () => {
     ),
   );
 
-  // The agent switches its own thread to another provider through a tool call,
-  // as t3_thread_configure does. The switch releases the Claude session running
-  // that call, so the turn fails and nothing is left to report how the call ended.
-  it.live("does not leave a tool call running after a switch releases its session", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const cwd = yield* checkpointWorkspace("switch-releases-tool-call");
-        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
-        const started = yield* Deferred.make<void>();
-        const toolCallId = TurnItemId.make("turn-item:thread-configure");
-        const scenarioThreadId = ThreadId.make("thread:switch-releases-tool-call");
-        const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
-          makeTestAdapter({
-            instanceId: CLAUDE_MODEL_SELECTION.instanceId,
-            driver: CLAUDE_DRIVER,
-            capabilities: ClaudeProviderCapabilitiesV2,
-            modelSelection: CLAUDE_MODEL_SELECTION,
-            responseByRunOrdinal: {},
-            capturedTurns,
-            holdFirstTurn: started,
-            heldRunningToolCall: toolCallId,
-          }),
-          makeTestAdapter({
-            instanceId: CODEX_MODEL_SELECTION.instanceId,
-            driver: CODEX_DRIVER,
-            capabilities: CodexProviderCapabilitiesV2,
-            modelSelection: CODEX_MODEL_SELECTION,
-            responseByRunOrdinal: {},
-            capturedTurns,
-          }),
-        ]);
-        yield* Effect.gen(function* () {
-          const orchestrator = yield* Orchestrator.OrchestratorV2;
-          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-          const awaitEvent = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
-            orchestrator.streamDomainEvents.pipe(
-              Stream.filter(predicate),
-              Stream.take(1),
-              Stream.runDrain,
-              Effect.forkScoped,
-            );
-          yield* orchestrator.dispatch({
-            type: "thread.create",
-            createdBy: "user",
-            creationSource: "web",
-            commandId: CommandId.make("command:switch-releases-tool-call:create"),
-            threadId: scenarioThreadId,
-            projectId: ProjectId.make("project:switch-releases-tool-call"),
-            title: "Switch releases tool call",
-            modelSelection: CLAUDE_MODEL_SELECTION,
-            runtimeMode: "full-access",
-            interactionMode: "default",
-            branch: null,
-            worktreePath: cwd,
-          });
-          const toolCallRunning = yield* awaitEvent(
-            (event) =>
-              event.type === "turn-item.updated" &&
-              event.payload.id === toolCallId &&
-              event.payload.status === "running",
-          );
-          yield* orchestrator.dispatch({
-            type: "message.dispatch",
-            createdBy: "user",
-            creationSource: "web",
-            commandId: CommandId.make("command:switch-releases-tool-call:message"),
-            threadId: scenarioThreadId,
-            messageId: MessageId.make("message:switch-releases-tool-call"),
-            text: "Switch this thread to Codex",
-            attachments: [],
-            modelSelection: CLAUDE_MODEL_SELECTION,
-            dispatchMode: { type: "start_immediately" },
-          });
-          yield* Deferred.await(started);
-          yield* Fiber.join(toolCallRunning);
-
-          const runFailed = yield* awaitEvent(
-            (event) => event.type === "run.updated" && event.payload.status === "failed",
-          );
-          yield* orchestrator.dispatch({
-            type: "provider.switch",
-            commandId: CommandId.make("command:switch-releases-tool-call:switch"),
-            threadId: scenarioThreadId,
-            modelSelection: CODEX_MODEL_SELECTION,
-          });
-          yield* worker.drain();
-          yield* Fiber.join(runFailed);
-
-          const projection = yield* orchestrator.getThreadProjection(scenarioThreadId);
-          assert.equal(
-            projection.turnItems.find((item) => item.id === toolCallId)?.status,
-            "interrupted",
-          );
-          assert.deepEqual(
-            derivePendingBackgroundWork({
-              latestRun: projection.runs.at(-1),
-              providerThreads: projection.providerThreads,
-              turnItems: projection.turnItems,
-              activeProviderThreadId: projection.thread.activeProviderThreadId,
-              runs: projection.runs,
+  // The agent releases its own Claude session through a tool call: switching the
+  // thread to another provider, as t3_thread_configure does, or handing it off
+  // to a new worktree, as t3_worktree_handoff does. The turn fails and nothing
+  // is left to report how the call ended.
+  it.live.each(["switch", "handoff"] as const)(
+    "does not leave a tool call running after a %s releases its session",
+    (release) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const key = `${release}-releases-tool-call`;
+          const worktreePath = yield* checkpointWorkspace(key);
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const started = yield* Deferred.make<void>();
+          const toolCallId = TurnItemId.make(`turn-item:${key}`);
+          const scenarioThreadId = ThreadId.make(`thread:${key}`);
+          const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+            makeTestAdapter({
+              instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+              driver: CLAUDE_DRIVER,
+              capabilities: ClaudeProviderCapabilitiesV2,
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              responseByRunOrdinal: {},
+              capturedTurns,
+              holdFirstTurn: started,
+              heldRunningToolCall:
+                release === "switch"
+                  ? {
+                      id: toolCallId,
+                      title: "T3 Thread Configure",
+                      toolName: "t3_thread_configure",
+                    }
+                  : {
+                      id: toolCallId,
+                      title: "T3 Worktree Handoff",
+                      toolName: "t3_worktree_handoff",
+                    },
             }),
-            [],
+            makeTestAdapter({
+              instanceId: CODEX_MODEL_SELECTION.instanceId,
+              driver: CODEX_DRIVER,
+              capabilities: CodexProviderCapabilitiesV2,
+              modelSelection: CODEX_MODEL_SELECTION,
+              responseByRunOrdinal: {},
+              capturedTurns,
+            }),
+          ]);
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const awaitEvent = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
+              orchestrator.streamDomainEvents.pipe(
+                Stream.filter(predicate),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make(`command:${key}:create`),
+              threadId: scenarioThreadId,
+              projectId: ProjectId.make(`project:${key}`),
+              title: "Tool call releases its session",
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+            });
+            const toolCallRunning = yield* awaitEvent(
+              (event) =>
+                event.type === "turn-item.updated" &&
+                event.payload.id === toolCallId &&
+                event.payload.status === "running",
+            );
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make(`command:${key}:message`),
+              threadId: scenarioThreadId,
+              messageId: MessageId.make(`message:${key}`),
+              text: "Release this session",
+              attachments: [],
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              dispatchMode: { type: "start_immediately" },
+            });
+            yield* Deferred.await(started);
+            yield* Fiber.join(toolCallRunning);
+
+            const runFailed = yield* awaitEvent(
+              (event) => event.type === "run.updated" && event.payload.status === "failed",
+            );
+            yield* orchestrator.dispatch(
+              release === "switch"
+                ? {
+                    type: "provider.switch",
+                    commandId: CommandId.make(`command:${key}:release`),
+                    threadId: scenarioThreadId,
+                    modelSelection: CODEX_MODEL_SELECTION,
+                  }
+                : {
+                    type: "thread.metadata.update",
+                    commandId: CommandId.make(`command:${key}:release`),
+                    threadId: scenarioThreadId,
+                    branch: `t3/${key}`,
+                    worktreePath,
+                    expectedWorktreePath: null,
+                  },
+            );
+            yield* worker.drain();
+            yield* Fiber.join(runFailed);
+
+            const projection = yield* orchestrator.getThreadProjection(scenarioThreadId);
+            assert.equal(
+              projection.turnItems.find((item) => item.id === toolCallId)?.status,
+              "interrupted",
+            );
+            assert.deepEqual(
+              derivePendingBackgroundWork({
+                latestRun: projection.runs.at(-1),
+                providerThreads: projection.providerThreads,
+                turnItems: projection.turnItems,
+                activeProviderThreadId: projection.thread.activeProviderThreadId,
+                runs: projection.runs,
+              }),
+              [],
+            );
+          }).pipe(
+            Effect.provide(ProviderReplayHarness.layerWithRegistry({ name: key }, layerRegistry)),
           );
-        }).pipe(
-          Effect.provide(
-            ProviderReplayHarness.layerWithRegistry(
-              { name: "switch-releases-tool-call" },
-              layerRegistry,
-            ),
-          ),
-        );
-      }),
-    ),
+        }),
+      ),
   );
 
   it.live("checks the queued provider's capability while the current provider stays running", () =>

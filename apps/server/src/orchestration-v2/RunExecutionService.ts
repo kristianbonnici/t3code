@@ -337,12 +337,10 @@ function emptyOpenRunToolCalls(): OpenRunToolCalls {
 }
 
 /**
- * Ends the tool calls a run left open when the run fails without its provider
- * ending the turn: the event stream was lost, such as when a provider switch
- * released the session mid-turn, or the turn failed to start. No process is
- * left to report how they ended, so they would otherwise stay running. They
- * were cut short, not failed: a call such as t3_thread_configure may have done
- * its work before the session went away.
+ * Ends the tool calls a run left open when its provider session was released
+ * before the turn ended. No process is left to report how they ended, so they
+ * would otherwise stay running. They were cut short, not failed: a call such
+ * as t3_thread_configure may have done its work before the session went away.
  */
 function interruptOpenRunToolCalls(input: {
   readonly run: OrchestrationV2Run;
@@ -656,7 +654,7 @@ export const layer: Layer.Layer<
       readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
       readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
       readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
-      /** Set only when the run fails without its provider ending the turn. */
+      /** Tool calls cut short because the run's provider session was released. */
       readonly abandonedToolCalls?: OpenRunToolCalls;
       readonly terminal: ProviderTerminalEvent;
       readonly failureItemPersisted: boolean;
@@ -1062,6 +1060,10 @@ export const layer: Layer.Layer<
           >(new Set(inheritedBackgroundTurnItemsById.keys()));
           const openRunOwnedSubagents = yield* Ref.make(emptyOpenRunOwnedSubagentProjection());
           const openToolCalls = yield* Ref.make(emptyOpenRunToolCalls());
+          // Only the session manager fails or ends this subscription, and only
+          // while releasing the session, which also closes the provider. A
+          // failure in T3's own handling of an event leaves the provider running.
+          const providerSessionLost = yield* Ref.make(false);
           const finalizeRootRun = (terminal: ProviderTerminalEvent) =>
             Effect.gen(function* () {
               if (yield* Ref.get(rootRunFinalized)) {
@@ -1339,6 +1341,7 @@ export const layer: Layer.Layer<
           });
           const filterAssistantEvent = makeAssistantStreamingFilter(responseStreamingMode);
           const providerEventFiber = yield* eventSubscription.events.pipe(
+            Stream.tapCause(() => Ref.set(providerSessionLost, true)),
             Stream.filterEffect((event) =>
               Ref.modify(eventRouting, (state) => routeProviderEvent(event, routeIdentity, state)),
             ),
@@ -1432,6 +1435,7 @@ export const layer: Layer.Layer<
                 if (terminal === null) {
                   // A session release interrupts or fails the stream; a clean
                   // end without a terminal means the run would never settle.
+                  yield* Ref.set(providerSessionLost, true);
                   return yield* new RunExecutionIngestError({
                     runId: input.run.id,
                     cause: new ProviderAdapter.ProviderAdapterEventStreamError({
@@ -1464,7 +1468,13 @@ export const layer: Layer.Layer<
                                   Effect.flatMap((latestItemOrdinal) =>
                                     Effect.all([
                                       Ref.get(openRunOwnedSubagents),
-                                      Ref.get(openToolCalls),
+                                      Ref.get(providerSessionLost).pipe(
+                                        Effect.flatMap((lost) =>
+                                          lost
+                                            ? Ref.get(openToolCalls)
+                                            : Effect.succeed(emptyOpenRunToolCalls()),
+                                        ),
+                                      ),
                                     ]).pipe(
                                       Effect.flatMap(([openSubagents, abandonedToolCalls]) =>
                                         writeFinalRunEvents({
@@ -1593,8 +1603,8 @@ export const layer: Layer.Layer<
                 Effect.flatMap((providerThread) =>
                   Ref.get(latestTurnItemOrdinal).pipe(
                     Effect.flatMap((latestItemOrdinal) =>
-                      Effect.all([Ref.get(openRunOwnedSubagents), Ref.get(openToolCalls)]).pipe(
-                        Effect.flatMap(([openSubagents, abandonedToolCalls]) =>
+                      Ref.get(openRunOwnedSubagents).pipe(
+                        Effect.flatMap((openSubagents) =>
                           writeFinalRunEvents({
                             run: input.run,
                             rootNode: input.rootNode,
@@ -1608,7 +1618,6 @@ export const layer: Layer.Layer<
                               expectedStatus: "running",
                             },
                             openRunOwnedSubagents: openSubagents,
-                            abandonedToolCalls,
                             terminal: makeFailedTerminalEvent(
                               makeProviderFailure({
                                 cause: Cause.squash(cause),
